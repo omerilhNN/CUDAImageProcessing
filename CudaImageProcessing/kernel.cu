@@ -1,6 +1,11 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #include <stdio.h>
 
 cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
