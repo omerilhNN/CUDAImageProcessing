@@ -79,7 +79,7 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="image_filters.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stb_image.h" />
