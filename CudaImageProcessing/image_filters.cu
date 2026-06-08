@@ -9,12 +9,17 @@
  * ----------------------------------------------------------------------------
  *  This single translation unit contains:
  *    - CPU (sequential) baselines for all three filters
- *    - Naive (global-memory) CUDA kernels for all three filters
- *    - Tiled (shared-memory) CUDA kernels for all three filters
+ *    - Four CUDA variants per filter (where applicable):
+ *        * naive      : one thread per pixel, global memory only
+ *        * tiled      : shared-memory tiled 2D convolution
+ *        * separable  : two 1D passes for Gaussian (O(K^2) -> O(2K))
+ *        * stream     : multi-stream pipelined H2D/kernel/D2H overlap
  *    - CUDA error checking (CUDA_CHECK / CUDA_CHECK_KERNEL)
- *    - Correctness validation (CPU vs GPU, with tolerance)
+ *    - Correctness validation (CPU vs GPU, with per-variant tolerance)
  *    - Timing: std::chrono for CPU, cudaEvent for kernel, H2D and D2H transfers
- *    - Speedup (kernel and end-to-end), throughput (MPixels/s)
+ *    - Speedup (kernel and end-to-end), throughput (MPixels/s), GFLOP/s
+ *    - Per-config roofline metrics: arithmetic intensity, achieved GB/s
+ *    - Theoretical peak memory bandwidth derived from device properties
  *    - Configurable image size and a multi-resolution / multi-blocksize sweep
  *    - CSV output (results.csv) for report tables & graphs
  *    - Optional dependency-free PGM image output (--save) to inspect filters
@@ -76,12 +81,23 @@ static const int MAX_MEDIAN_WIN = 49;
 
 // Read-only filter weights live in constant memory: cached and broadcast
 // efficiently when every thread in a warp reads the same address.
-__constant__ float c_gauss[MAX_GAUSS_K * MAX_GAUSS_K];
+__constant__ float c_gauss[MAX_GAUSS_K * MAX_GAUSS_K];     // 2D weights
+__constant__ float c_gauss1D[MAX_GAUSS_K];                 // 1D weights (separable)
 __constant__ float c_sobelX[9];
 __constant__ float c_sobelY[9];
 
 enum FilterType { F_GAUSSIAN = 0, F_SOBEL = 1, F_MEDIAN = 2 };
-enum Variant { V_NAIVE = 0, V_TILED = 1 };
+// Variants:
+//   V_NAIVE     : one thread per pixel, all reads from global memory
+//   V_TILED     : shared-memory tiled 2D convolution (KxK)
+//   V_SEPARABLE : two-pass 1D convolution (horizontal then vertical),
+//                 reduces arithmetic from O(K^2) to O(2K) per output pixel.
+//                 Mathematically equivalent for Gaussian (the 2D Gaussian is
+//                 the outer product of two 1D Gaussians). Not applicable to
+//                 Sobel-magnitude (sqrt of two gradients) or Median (rank op).
+//   V_STREAM    : tiled 2D convolution, but with H2D/kernel/D2H overlapped
+//                 across multiple CUDA streams (end-to-end pipelining).
+enum Variant { V_NAIVE = 0, V_TILED = 1, V_SEPARABLE = 2, V_STREAM = 3 };
 
 static const char* filterName(FilterType f) {
     switch (f) {
@@ -90,7 +106,14 @@ static const char* filterName(FilterType f) {
     default:         return "Median";
     }
 }
-static const char* variantName(Variant v) { return v == V_NAIVE ? "naive" : "tiled"; }
+static const char* variantName(Variant v) {
+    switch (v) {
+    case V_NAIVE:     return "naive";
+    case V_TILED:     return "tiled";
+    case V_SEPARABLE: return "separable";
+    default:          return "stream";
+    }
+}
 
 // ============================================================================
 // 3. SMALL HOST/DEVICE HELPERS
@@ -115,6 +138,23 @@ static void makeGaussianKernel(std::vector<float>& k, int radius, float sigma) {
             sum += w;
         }
     for (float& w : k) w /= sum;          // normalize so the image stays in [0,255]
+}
+
+// Build a normalized 1D Gaussian kernel for separable filtering.
+// The 2D Gaussian G(x,y) = exp(-(x^2+y^2)/2s^2) factors as g(x)*g(y) where
+// g(t) = exp(-t^2/2s^2). Applying g horizontally then vertically is therefore
+// mathematically equivalent to the full 2D convolution, but cuts the work
+// per output pixel from K^2 multiply-adds to 2*K.
+static void makeGaussianKernel1D(std::vector<float>& k, int radius, float sigma) {
+    const int K = 2 * radius + 1;
+    k.assign(K, 0.0f);
+    float sum = 0.0f;
+    for (int x = -radius; x <= radius; ++x) {
+        float w = std::exp(-(x * x) / (2.0f * sigma * sigma));
+        k[x + radius] = w;
+        sum += w;
+    }
+    for (float& w : k) w /= sum;
 }
 
 // Deterministic synthetic 8-bit grayscale image: smooth waves + a checkerboard
@@ -364,6 +404,72 @@ __global__ void medianTiled(const unsigned char* in, unsigned char* out,
 }
 
 // ============================================================================
+// 6b. SEPARABLE GAUSSIAN  (V_SEPARABLE)
+//     Two 1D passes instead of one 2D pass. For a KxK kernel this reduces
+//     arithmetic intensity from K^2 to 2K MAdds per output pixel (a 7.5x
+//     reduction at K=15) while producing a bit-equivalent result up to
+//     floating-point rounding. Two kernels: horizontal then vertical. Both
+//     use a thin tile (only halo in the pass direction) to maximize shared
+//     memory reuse and minimize bank conflicts.
+//
+//     Pass 1 (horizontal):  out[y,x] = sum_k g1D[k] * in[y, x + k - r]
+//     Pass 2 (vertical):    out[y,x] = sum_k g1D[k] * in[y + k - r, x]
+// ============================================================================
+
+// Horizontal pass: blockDim.y rows, each thread reads a tile of width
+// (blockDim.x + 2*radius) and reduces across radius in X.
+__global__ void gaussianSeparableH(const unsigned char* in, float* out,
+    int W, int H, int radius) {
+    extern __shared__ unsigned char stile[];
+    int tileW = blockDim.x + 2 * radius;
+    // Load: each row independent, halo only in X.
+    int baseX = blockIdx.x * blockDim.x - radius;
+    int baseY = blockIdx.y * blockDim.y;
+    int ly = threadIdx.y;
+    int gy = baseY + ly;
+    int gyClamped = min(max(gy, 0), H - 1);
+    for (int tx = threadIdx.x; tx < tileW; tx += blockDim.x) {
+        int gx = min(max(baseX + tx, 0), W - 1);
+        stile[ly * tileW + tx] = in[(size_t)gyClamped * W + gx];
+    }
+    __syncthreads();
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= W || gy >= H) return;
+    const int K = 2 * radius + 1;
+    float acc = 0.0f;
+    for (int kx = 0; kx < K; ++kx)
+        acc += stile[ly * tileW + (threadIdx.x + kx)] * c_gauss1D[kx];
+    // Write intermediate as float to avoid quantizing twice (better PSNR).
+    out[(size_t)gy * W + x] = acc;
+}
+
+// Vertical pass: reads float intermediate, halo only in Y, writes uint8.
+__global__ void gaussianSeparableV(const float* in, unsigned char* out,
+    int W, int H, int radius) {
+    extern __shared__ float ftile[];
+    int tileH = blockDim.y + 2 * radius;
+    int baseX = blockIdx.x * blockDim.x;
+    int baseY = blockIdx.y * blockDim.y - radius;
+    int lx = threadIdx.x;
+    int gx = baseX + lx;
+    int gxClamped = min(max(gx, 0), W - 1);
+    for (int ty = threadIdx.y; ty < tileH; ty += blockDim.y) {
+        int gy = min(max(baseY + ty, 0), H - 1);
+        ftile[ty * blockDim.x + lx] = in[(size_t)gy * W + gxClamped];
+    }
+    __syncthreads();
+
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (gx >= W || y >= H) return;
+    const int K = 2 * radius + 1;
+    float acc = 0.0f;
+    for (int ky = 0; ky < K; ++ky)
+        acc += ftile[(threadIdx.y + ky) * blockDim.x + lx] * c_gauss1D[ky];
+    out[(size_t)y * W + gx] = (unsigned char)clampf(acc + 0.5f, 0.0f, 255.0f);
+}
+
+// ============================================================================
 // 7. VALIDATION  (proposal step 5)
 // ============================================================================
 
@@ -401,22 +507,42 @@ static ValStats validate(const unsigned char* cpu, const unsigned char* gpu,
 
 struct GpuTiming { float h2d_ms, kernel_ms, d2h_ms; };
 
+// Forward declaration for the streamed/pipelined runner (defined below).
+static GpuTiming runGpuStreamed(FilterType filter, const unsigned char* h_in,
+    unsigned char* h_out, int W, int H, int radius, dim3 block, int iters,
+    int nStreams, int nTiles);
+
 static GpuTiming runGpu(FilterType filter, Variant variant,
     const unsigned char* h_in, unsigned char* h_out,
     unsigned char* d_in, unsigned char* d_out,
     int W, int H, int radius, dim3 block, int iters) {
+    // Streamed variant has its own dedicated runner: it needs pinned host
+    // memory and multiple device buffers, which the single-shot path does
+    // not allocate. Delegate.
+    if (variant == V_STREAM) {
+        return runGpuStreamed(filter, h_in, h_out, W, H, radius, block, iters,
+            /*nStreams=*/4, /*nTiles=*/8);
+    }
+
     const size_t bytes = (size_t)W * H;
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
     int tileW = block.x + 2 * radius;
     int tileH = block.y + 2 * radius;
     size_t shmem = (size_t)tileW * tileH * sizeof(unsigned char); // tiled only
 
+    // For the separable variant we need an intermediate float buffer of W*H
+    // floats to hold the horizontal-pass output.
+    float* d_inter = nullptr;
+    if (variant == V_SEPARABLE) {
+        CUDA_CHECK(cudaMalloc(&d_inter, (size_t)W * H * sizeof(float)));
+    }
+
     cudaEvent_t a, b;
     CUDA_CHECK(cudaEventCreate(&a));
     CUDA_CHECK(cudaEventCreate(&b));
     GpuTiming t{ 0, 0, 0 };
 
-    // --- Host -> Device transfer (step 8) ---
+    // --- Host -> Device transfer ---
     CUDA_CHECK(cudaEventRecord(a));
     CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaEventRecord(b));
@@ -430,10 +556,18 @@ static GpuTiming runGpu(FilterType filter, Variant variant,
             else if (filter == F_SOBEL)    sobelNaive << <grid, block >> > (d_in, d_out, W, H);
             else                           medianNaive << <grid, block >> > (d_in, d_out, W, H, radius);
         }
-        else {
+        else if (variant == V_TILED) {
             if (filter == F_GAUSSIAN) gaussianTiled << <grid, block, shmem >> > (d_in, d_out, W, H, radius);
             else if (filter == F_SOBEL)    sobelTiled << <grid, block, shmem >> > (d_in, d_out, W, H);
             else                           medianTiled << <grid, block, shmem >> > (d_in, d_out, W, H, radius);
+        }
+        else { // V_SEPARABLE - only valid for Gaussian
+            // Horizontal pass: tile is blockDim.y rows x (blockDim.x + 2r) cols of uint8.
+            size_t shH = (size_t)block.y * (block.x + 2 * radius) * sizeof(unsigned char);
+            gaussianSeparableH << <grid, block, shH >> > (d_in, d_inter, W, H, radius);
+            // Vertical pass: tile is (blockDim.y + 2r) rows x blockDim.x cols of float.
+            size_t shV = (size_t)(block.y + 2 * radius) * block.x * sizeof(float);
+            gaussianSeparableV << <grid, block, shV >> > (d_inter, d_out, W, H, radius);
         }
         };
 
@@ -441,25 +575,149 @@ static GpuTiming runGpu(FilterType filter, Variant variant,
     launch();
     CUDA_CHECK_KERNEL();
 
-    // --- Timed kernel: average over `iters` launches (step 7) ---
+    // --- Timed kernel: average over `iters` launches ---
     CUDA_CHECK(cudaEventRecord(a));
     for (int i = 0; i < iters; ++i) launch();
     CUDA_CHECK(cudaEventRecord(b));
     CUDA_CHECK(cudaEventSynchronize(b));
-    CUDA_CHECK(cudaGetLastError());                 // catch any launch error
+    CUDA_CHECK(cudaGetLastError());
     float total = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&total, a, b));
     t.kernel_ms = total / iters;
 
-    // --- Device -> Host transfer (step 8) ---
+    // --- Device -> Host transfer ---
     CUDA_CHECK(cudaEventRecord(a));
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaEventRecord(b));
     CUDA_CHECK(cudaEventSynchronize(b));
     CUDA_CHECK(cudaEventElapsedTime(&t.d2h_ms, a, b));
 
+    if (d_inter) CUDA_CHECK(cudaFree(d_inter));
     CUDA_CHECK(cudaEventDestroy(a));
     CUDA_CHECK(cudaEventDestroy(b));
+    return t;
+}
+
+// ============================================================================
+// 8b. STREAMED / PIPELINED RUNNER  (V_STREAM)
+//   Splits the image into N horizontal strips and processes them on a
+//   round-robin of CUDA streams. Each stream alternates H2D / kernel / D2H,
+//   and CUDA overlaps these stages across streams as long as the host buffer
+//   is pinned (cudaHostAlloc). The result is dramatic end-to-end (e2e)
+//   speedup because the PCIe transfer time is hidden behind kernel execution.
+//
+//   For correctness with a convolution that has a halo, each strip must
+//   include `radius` extra rows of overlap with its neighbours on both sides
+//   (top and bottom). We only WRITE the strip's core rows back, so the
+//   overlap is read-only and stitching is seamless.
+// ============================================================================
+
+static GpuTiming runGpuStreamed(FilterType filter, const unsigned char* h_in,
+    unsigned char* h_out, int W, int H, int radius, dim3 block, int iters,
+    int nStreams, int nTiles) {
+    const size_t bytes = (size_t)W * H;
+
+    // 1) Pinned host buffers (required for true async overlap).
+    unsigned char* h_in_pinned = nullptr;
+    unsigned char* h_out_pinned = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_in_pinned, bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaHostAlloc(&h_out_pinned, bytes, cudaHostAllocDefault));
+    std::memcpy(h_in_pinned, h_in, bytes);
+
+    // 2) One device input strip + one device output strip per stream, sized
+    //    for the largest possible strip (ceil(H/nTiles) + 2*radius rows).
+    int stripRowsMax = (H + nTiles - 1) / nTiles + 2 * radius;
+    size_t stripBytesMax = (size_t)W * stripRowsMax;
+
+    std::vector<cudaStream_t> streams(nStreams);
+    std::vector<unsigned char*> d_inS(nStreams, nullptr);
+    std::vector<unsigned char*> d_outS(nStreams, nullptr);
+    for (int s = 0; s < nStreams; ++s) {
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+        CUDA_CHECK(cudaMalloc(&d_inS[s], stripBytesMax));
+        CUDA_CHECK(cudaMalloc(&d_outS[s], stripBytesMax));
+    }
+
+    cudaEvent_t a, b;
+    CUDA_CHECK(cudaEventCreate(&a));
+    CUDA_CHECK(cudaEventCreate(&b));
+
+    auto launchStrip = [&](int strip, cudaStream_t st) {
+        int rowStart = strip * ((H + nTiles - 1) / nTiles);
+        int rowEnd = std::min(rowStart + (H + nTiles - 1) / nTiles, H);
+        if (rowStart >= rowEnd) return;
+
+        // Strip with halo (clamped to image bounds).
+        int srcRowStart = std::max(rowStart - radius, 0);
+        int srcRowEnd = std::min(rowEnd + radius, H);
+        int stripH = srcRowEnd - srcRowStart;
+        size_t stripBytes = (size_t)W * stripH;
+
+        // Async H2D (only this strip + halo).
+        CUDA_CHECK(cudaMemcpyAsync(d_inS[strip % nStreams],
+            h_in_pinned + (size_t)srcRowStart * W,
+            stripBytes, cudaMemcpyHostToDevice, st));
+
+        // Launch tiled kernel on the strip. Grid covers full strip including halo;
+        // boundary checks inside the kernel keep us safe.
+        dim3 grid((W + block.x - 1) / block.x, (stripH + block.y - 1) / block.y);
+        int tileW = block.x + 2 * radius;
+        int tileH = block.y + 2 * radius;
+        size_t shmem = (size_t)tileW * tileH * sizeof(unsigned char);
+        if (filter == F_GAUSSIAN)
+            gaussianTiled << <grid, block, shmem, st >> > (d_inS[strip % nStreams],
+                d_outS[strip % nStreams], W, stripH, radius);
+        else if (filter == F_SOBEL)
+            // Sobel kernel signature: (in, out, W, H) -- radius is fixed at 1.
+            sobelTiled << <grid, block, shmem, st >> > (d_inS[strip % nStreams],
+                d_outS[strip % nStreams], W, stripH);
+        else
+            medianTiled << <grid, block, shmem, st >> > (d_inS[strip % nStreams],
+                d_outS[strip % nStreams], W, stripH, radius);
+
+        // Async D2H: copy only the strip's core rows (skip halo) back.
+        int coreOffsetInStrip = rowStart - srcRowStart;   // rows of halo at top
+        int coreRows = rowEnd - rowStart;
+        CUDA_CHECK(cudaMemcpyAsync(h_out_pinned + (size_t)rowStart * W,
+            d_outS[strip % nStreams] + (size_t)coreOffsetInStrip * W,
+            (size_t)W * coreRows, cudaMemcpyDeviceToHost, st));
+        };
+
+    // Warm-up pass (not timed).
+    for (int strip = 0; strip < nTiles; ++strip)
+        launchStrip(strip, streams[strip % nStreams]);
+    for (auto& st : streams) CUDA_CHECK(cudaStreamSynchronize(st));
+
+    // Timed end-to-end run, averaged over `iters`.
+    CUDA_CHECK(cudaEventRecord(a));
+    for (int it = 0; it < iters; ++it) {
+        for (int strip = 0; strip < nTiles; ++strip)
+            launchStrip(strip, streams[strip % nStreams]);
+        for (auto& st : streams) CUDA_CHECK(cudaStreamSynchronize(st));
+    }
+    CUDA_CHECK(cudaEventRecord(b));
+    CUDA_CHECK(cudaEventSynchronize(b));
+    float total = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total, a, b));
+
+    // Copy result out of the pinned buffer.
+    std::memcpy(h_out, h_out_pinned, bytes);
+
+    // Cleanup.
+    for (int s = 0; s < nStreams; ++s) {
+        CUDA_CHECK(cudaStreamDestroy(streams[s]));
+        CUDA_CHECK(cudaFree(d_inS[s]));
+        CUDA_CHECK(cudaFree(d_outS[s]));
+    }
+    CUDA_CHECK(cudaFreeHost(h_in_pinned));
+    CUDA_CHECK(cudaFreeHost(h_out_pinned));
+    CUDA_CHECK(cudaEventDestroy(a));
+    CUDA_CHECK(cudaEventDestroy(b));
+
+    // For streamed mode we report the *full pipeline* time under kernel_ms
+    // and zero H2D/D2H, since the whole point is that they are overlapped:
+    // the wall-clock end-to-end time is the meaningful number.
+    GpuTiming t{ 0.0f, total / iters, 0.0f };
     return t;
 }
 
@@ -470,10 +728,59 @@ static GpuTiming runGpu(FilterType filter, Variant variant,
 static void uploadWeights(FilterType filter, int radius) {
     if (filter == F_GAUSSIAN) {
         std::vector<float> g;
-        makeGaussianKernel(g, radius, /*sigma=*/std::max(1.0f, radius / 2.0f));
+        float sigma = std::max(1.0f, radius / 2.0f);
+        makeGaussianKernel(g, radius, sigma);
         CUDA_CHECK(cudaMemcpyToSymbol(c_gauss, g.data(), g.size() * sizeof(float)));
+        // 1D weights for the separable variant.
+        std::vector<float> g1;
+        makeGaussianKernel1D(g1, radius, sigma);
+        CUDA_CHECK(cudaMemcpyToSymbol(c_gauss1D, g1.data(), g1.size() * sizeof(float)));
     }
     // Sobel weights are constant for the whole program (uploaded once in main).
+}
+
+// Per-pixel arithmetic intensity model (FLOPs/byte from global memory).
+// This is a rough analytic estimate used to place each kernel on the
+// roofline plot. It counts:
+//   - FLOPs per output pixel based on filter math
+//   - Bytes transferred per output pixel, assuming perfect shared-memory
+//     reuse for the tiled variants (1 byte read + 1 byte written), and
+//     a full K*K reload for the naive variants.
+//
+// Returns: { flops_per_pixel, bytes_per_pixel }
+struct RooflineInfo { double flops_pp; double bytes_pp; };
+
+static RooflineInfo computeRoofline(FilterType filter, Variant variant, int radius) {
+    int K = 2 * radius + 1;
+    double flops = 0.0, bytes = 0.0;
+    if (filter == F_GAUSSIAN) {
+        if (variant == V_SEPARABLE) {
+            // 2 passes, each K muls + K adds = 2K FLOPs/pixel -> 4K total.
+            flops = 4.0 * K;
+            // H pass: read K bytes, write 4 bytes float (intermediate).
+            // V pass: read K floats (4K bytes), write 1 byte.
+            // With shared-memory reuse: ~1 byte in, 4 bytes intermediate,
+            // 4 bytes intermediate in (perfect reuse), 1 byte out.
+            bytes = 1 + 4 + 4 + 1;
+        }
+        else {
+            // 2D Gaussian: K^2 mul + K^2 add = 2*K^2 FLOPs/pixel.
+            flops = 2.0 * K * K;
+            bytes = (variant == V_NAIVE) ? (double)K * K + 1 : 1 + 1;
+        }
+    }
+    else if (filter == F_SOBEL) {
+        // 2 * 9 MAdds + magnitude (mul, mul, add, sqrt ~ 4 FLOPs) = ~40 FLOPs.
+        flops = 40.0;
+        bytes = (variant == V_NAIVE) ? 9.0 + 1 : 1 + 1;
+    }
+    else { // F_MEDIAN
+        // Insertion sort on K*K elements: ~K^4 / 4 comparisons (avg).
+        // We count each compare as 1 FLOP-equivalent op.
+        flops = 0.25 * (double)K * K * K * K;
+        bytes = (variant == V_NAIVE) ? (double)K * K + 1 : 1 + 1;
+    }
+    return { flops, bytes };
 }
 
 static void runConfig(std::ofstream& csv, FilterType filter, Variant variant,
@@ -488,7 +795,10 @@ static void runConfig(std::ofstream& csv, FilterType filter, Variant variant,
     GpuTiming gt = runGpu(filter, variant, h_in.data(), gpuOut.data(),
         d_in, d_out, W, H, radius, block, gpuIters);
 
-    int tol = (filter == F_MEDIAN) ? 0 : 1;
+    // Tolerance: Gaussian/Sobel use float math -> last-bit rounding ok.
+    // Median is integer -> exact. Separable Gaussian does two float passes
+    // with an intermediate quantization, so allow slightly more slack.
+    int tol = (filter == F_MEDIAN) ? 0 : (variant == V_SEPARABLE ? 2 : 1);
     ValStats vs = cpuValid ? validate(cpuOut.data(), gpuOut.data(), N, tol)
         : ValStats{ -1, -1, false };
 
@@ -498,18 +808,27 @@ static void runConfig(std::ofstream& csv, FilterType filter, Variant variant,
     double mpix = (double)N / (gt.kernel_ms * 1e-3) / 1e6;
     int K = 2 * radius + 1;
 
-    printf("  %-9s %-5s K=%-2d block=%2dx%-2d | CPU %9.3f ms | "
-        "H2D %7.3f  ker %8.4f  D2H %7.3f | tot %8.3f | "
-        "kSpd %7.1fx  e2e %6.1fx | %6.1f MPix/s | %s (maxDiff=%d)\n",
+    // Roofline metrics.
+    RooflineInfo ri = computeRoofline(filter, variant, radius);
+    double totalFlops = ri.flops_pp * (double)N;
+    double totalBytes = ri.bytes_pp * (double)N;
+    double gflops = totalFlops / (gt.kernel_ms * 1e-3) / 1e9;
+    double gbps = totalBytes / (gt.kernel_ms * 1e-3) / 1e9;
+    double ai = ri.flops_pp / ri.bytes_pp;   // arithmetic intensity
+
+    printf("  %-9s %-9s K=%-2d block=%2dx%-2d | CPU %9.3f ms | "
+        "ker %8.4f | tot %8.3f | kSpd %7.1fx e2e %6.1fx | "
+        "%6.1f MPix/s %6.1f GF/s AI=%4.1f | %s\n",
         filterName(filter), variantName(variant), K, block.x, block.y,
-        cpuMs, gt.h2d_ms, gt.kernel_ms, gt.d2h_ms, totalGpu,
-        kSpeedup, e2eSpeedup, mpix,
-        cpuValid ? (vs.pass ? "PASS" : "FAIL") : "skip", vs.maxDiff);
+        cpuMs, gt.kernel_ms, totalGpu, kSpeedup, e2eSpeedup,
+        mpix, gflops, ai,
+        cpuValid ? (vs.pass ? "PASS" : "FAIL") : "skip");
 
     csv << filterName(filter) << ',' << W << ',' << H << ',' << K << ','
         << variantName(variant) << ',' << block.x << ',' << block.y << ','
         << cpuMs << ',' << gt.h2d_ms << ',' << gt.kernel_ms << ',' << gt.d2h_ms << ','
         << totalGpu << ',' << kSpeedup << ',' << e2eSpeedup << ',' << mpix << ','
+        << gflops << ',' << gbps << ',' << ai << ','
         << vs.maxDiff << ',' << vs.mismatches << ','
         << (cpuValid ? (vs.pass ? "PASS" : "FAIL") : "skip") << '\n';
 }
@@ -576,7 +895,18 @@ static void runResolution(std::ofstream& csv, int W, int H, int gpuIters,
                     h_in, cpuOut, cpuMs, true, d_in, d_out);
                 runConfig(csv, cfg.f, V_TILED, W, H, radius, block, gpuIters,
                     h_in, cpuOut, cpuMs, true, d_in, d_out);
+                // Separable variant only meaningful for Gaussian.
+                if (cfg.f == F_GAUSSIAN) {
+                    runConfig(csv, cfg.f, V_SEPARABLE, W, H, radius, block, gpuIters,
+                        h_in, cpuOut, cpuMs, true, d_in, d_out);
+                }
             }
+            // Streamed variant: report only at one canonical block size
+            // (16x16). It is an end-to-end pipelining optimization, not
+            // a kernel optimization, so block-size sweeping is not the
+            // point. We do it once per (filter,radius).
+            runConfig(csv, cfg.f, V_STREAM, W, H, radius, dim3(16, 16), gpuIters,
+                h_in, cpuOut, cpuMs, true, d_in, d_out);
         }
     }
 
@@ -603,9 +933,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaSetDevice(0));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    printf("GPU: %s | SMs: %d | Compute %d.%d | GlobalMem %.1f GB\n",
+    // Note: cudaDeviceProp::memoryClockRate and ::clockRate were deprecated
+    // and removed in CUDA 13. Theoretical peak bandwidth is therefore taken
+    // as a runtime parameter to analyze_results.py (--peak-bw) rather than
+    // computed here. For RTX 4060 Laptop ~256 GB/s; for RTX 3060 ~360 GB/s.
+    printf("GPU: %s | SMs: %d | Compute %d.%d | GlobalMem %.1f GB | "
+        "MemBus %d-bit\n",
         prop.name, prop.multiProcessorCount, prop.major, prop.minor,
-        prop.totalGlobalMem / 1e9);
+        prop.totalGlobalMem / 1e9, prop.memoryBusWidth);
 
     // Upload the (fixed) Sobel kernels to constant memory once.
     const float hSobelX[9] = { -1, 0, 1, -2, 0, 2, -1, 0, 1 };
@@ -638,6 +973,7 @@ int main(int argc, char** argv) {
     csv << "Filter,Width,Height,KernelSize,Variant,BlockX,BlockY,"
         "CPU_ms,H2D_ms,Kernel_ms,D2H_ms,Total_GPU_ms,"
         "Kernel_Speedup,EndToEnd_Speedup,Throughput_MPixPerSec,"
+        "GFLOPS,GBps,ArithmeticIntensity,"
         "MaxAbsDiff,Mismatches,Validation\n";
 
     printf("GPU kernel timing averaged over %d iteration(s).\n", iters);
