@@ -126,6 +126,25 @@ __host__ __device__ inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// --- Branchless 3x3 median (19 karsilastirma) ---
+// K==3 icin insertion sort yerine kullanilir: daha hizli, warp divergence yok.
+// Sonuc insertion sort ile birebir ayni (median secimi), tol=0 PASS kalir.
+__device__ inline void mmx(unsigned char& a, unsigned char& b) {
+    unsigned char lo = a < b ? a : b;
+    unsigned char hi = a < b ? b : a;
+    a = lo; b = hi;
+}
+__device__ inline unsigned char median9(unsigned char* p) {
+    mmx(p[1], p[2]); mmx(p[4], p[5]); mmx(p[7], p[8]);
+    mmx(p[0], p[1]); mmx(p[3], p[4]); mmx(p[6], p[7]);
+    mmx(p[1], p[2]); mmx(p[4], p[5]); mmx(p[7], p[8]);
+    mmx(p[0], p[3]); mmx(p[5], p[8]); mmx(p[4], p[7]);
+    mmx(p[3], p[6]); mmx(p[1], p[4]); mmx(p[2], p[5]);
+    mmx(p[4], p[7]); mmx(p[4], p[2]); mmx(p[6], p[4]);
+    mmx(p[4], p[2]);
+    return p[4];
+}
+
 // Build a normalized 2D Gaussian kernel (weights sum to 1.0).
 static void makeGaussianKernel(std::vector<float>& k, int radius, float sigma) {
     const int K = 2 * radius + 1;
@@ -258,8 +277,8 @@ static void cpuMedian(const unsigned char* in, unsigned char* out,
 //    Boundary handling via clamp-to-edge so every thread is in-bounds-safe.
 // ============================================================================
 
-__global__ void gaussianNaive(const unsigned char* in, unsigned char* out,
-    int W, int H, int radius) {
+__global__ void gaussianNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H, int radius) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;                       // grid may overshoot image
@@ -274,12 +293,15 @@ __global__ void gaussianNaive(const unsigned char* in, unsigned char* out,
     out[(size_t)y * W + x] = (unsigned char)clampf(acc + 0.5f, 0.0f, 255.0f);
 }
 
-__global__ void sobelNaive(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void sobelNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     float sx = 0.0f, sy = 0.0f;
+#pragma unroll
     for (int ky = -1; ky <= 1; ++ky)
+#pragma unroll
         for (int kx = -1; kx <= 1; ++kx) {
             int px = min(max(x + kx, 0), W - 1);
             int py = min(max(y + ky, 0), H - 1);
@@ -292,8 +314,8 @@ __global__ void sobelNaive(const unsigned char* in, unsigned char* out, int W, i
     out[(size_t)y * W + x] = (unsigned char)clampf(mag, 0.0f, 255.0f);
 }
 
-__global__ void medianNaive(const unsigned char* in, unsigned char* out,
-    int W, int H, int radius) {
+__global__ void medianNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H, int radius) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
@@ -307,6 +329,8 @@ __global__ void medianNaive(const unsigned char* in, unsigned char* out,
             int sy = min(max(y + ky, 0), H - 1);
             w[c++] = in[(size_t)sy * W + sx];
         }
+    // 3x3 icin hizli yol: dalsiz median agi.
+    if (n == 9) { out[(size_t)y * W + x] = median9(w); return; }
     for (int i = 1; i < n; ++i) {
         unsigned char key = w[i]; int j = i - 1;
         while (j >= 0 && w[j] > key) { w[j + 1] = w[j]; --j; }
@@ -323,7 +347,8 @@ __global__ void medianNaive(const unsigned char* in, unsigned char* out,
 // ============================================================================
 
 // Cooperative halo load shared by all tiled kernels.
-__device__ inline void loadTile(unsigned char* tile, const unsigned char* in,
+__device__ inline void loadTile(unsigned char* __restrict__ tile,
+    const unsigned char* __restrict__ in,
     int W, int H, int radius, int tileW, int tileH) {
     int baseX = blockIdx.x * blockDim.x - radius;   // top-left of tile in image space
     int baseY = blockIdx.y * blockDim.y - radius;
@@ -335,8 +360,8 @@ __device__ inline void loadTile(unsigned char* tile, const unsigned char* in,
         }
 }
 
-__global__ void gaussianTiled(const unsigned char* in, unsigned char* out,
-    int W, int H, int radius) {
+__global__ void gaussianTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H, int radius) {
     extern __shared__ unsigned char tile[];
     int tileW = blockDim.x + 2 * radius;
     int tileH = blockDim.y + 2 * radius;
@@ -354,7 +379,8 @@ __global__ void gaussianTiled(const unsigned char* in, unsigned char* out,
     out[(size_t)y * W + x] = (unsigned char)clampf(acc + 0.5f, 0.0f, 255.0f);
 }
 
-__global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void sobelTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     extern __shared__ unsigned char tile[];
     const int radius = 1;
     int tileW = blockDim.x + 2 * radius;
@@ -366,7 +392,9 @@ __global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, i
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     float sx = 0.0f, sy = 0.0f;
+#pragma unroll
     for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
         for (int kx = 0; kx < 3; ++kx) {
             int p = tile[(threadIdx.y + ky) * tileW + (threadIdx.x + kx)];
             int idx = ky * 3 + kx;
@@ -377,8 +405,8 @@ __global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, i
     out[(size_t)y * W + x] = (unsigned char)clampf(mag, 0.0f, 255.0f);
 }
 
-__global__ void medianTiled(const unsigned char* in, unsigned char* out,
-    int W, int H, int radius) {
+__global__ void medianTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H, int radius) {
     extern __shared__ unsigned char tile[];
     int tileW = blockDim.x + 2 * radius;
     int tileH = blockDim.y + 2 * radius;
@@ -395,6 +423,8 @@ __global__ void medianTiled(const unsigned char* in, unsigned char* out,
     for (int ky = 0; ky < K; ++ky)
         for (int kx = 0; kx < K; ++kx)
             w[c++] = tile[(threadIdx.y + ky) * tileW + (threadIdx.x + kx)];
+    // 3x3 icin hizli yol: dalsiz median agi.
+    if (n == 9) { out[(size_t)y * W + x] = median9(w); return; }
     for (int i = 1; i < n; ++i) {
         unsigned char key = w[i]; int j = i - 1;
         while (j >= 0 && w[j] > key) { w[j + 1] = w[j]; --j; }
@@ -418,8 +448,8 @@ __global__ void medianTiled(const unsigned char* in, unsigned char* out,
 
 // Horizontal pass: blockDim.y rows, each thread reads a tile of width
 // (blockDim.x + 2*radius) and reduces across radius in X.
-__global__ void gaussianSeparableH(const unsigned char* in, float* out,
-    int W, int H, int radius) {
+__global__ void gaussianSeparableH(const unsigned char* __restrict__ in,
+    float* __restrict__ out, int W, int H, int radius) {
     extern __shared__ unsigned char stile[];
     int tileW = blockDim.x + 2 * radius;
     // Load: each row independent, halo only in X.
@@ -445,8 +475,8 @@ __global__ void gaussianSeparableH(const unsigned char* in, float* out,
 }
 
 // Vertical pass: reads float intermediate, halo only in Y, writes uint8.
-__global__ void gaussianSeparableV(const float* in, unsigned char* out,
-    int W, int H, int radius) {
+__global__ void gaussianSeparableV(const float* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H, int radius) {
     extern __shared__ float ftile[];
     int tileH = blockDim.y + 2 * radius;
     int baseX = blockIdx.x * blockDim.x;

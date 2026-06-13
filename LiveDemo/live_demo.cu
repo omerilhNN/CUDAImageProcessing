@@ -51,9 +51,9 @@
         }                                                                      \
     } while (0)
 
-// ============================================================================
-// CONSTANT MEMORY for filter weights (same idea as image_filters.cu)
-// ============================================================================
+ // ============================================================================
+ // CONSTANT MEMORY for filter weights (same idea as image_filters.cu)
+ // ============================================================================
 __constant__ float c_sobelX[9] = { -1, 0, 1, -2, 0, 2, -1, 0, 1 };
 __constant__ float c_sobelY[9] = { -1, -2, -1, 0, 0, 0, 1, 2, 1 };
 __constant__ float c_gauss5[25];        // 5x5 Gaussian weights
@@ -147,8 +147,27 @@ __device__ inline int clampi_dev(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// --- Branchless 3x3 median (19 karsilastirma) ---
+// Insertion sort'a gore daha hizli ve warp divergence yaratmaz.
+__device__ inline void mmx(unsigned char& a, unsigned char& b) {
+    unsigned char lo = a < b ? a : b;
+    unsigned char hi = a < b ? b : a;
+    a = lo; b = hi;
+}
+__device__ inline unsigned char median9(unsigned char* p) {
+    mmx(p[1], p[2]); mmx(p[4], p[5]); mmx(p[7], p[8]);
+    mmx(p[0], p[1]); mmx(p[3], p[4]); mmx(p[6], p[7]);
+    mmx(p[1], p[2]); mmx(p[4], p[5]); mmx(p[7], p[8]);
+    mmx(p[0], p[3]); mmx(p[5], p[8]); mmx(p[4], p[7]);
+    mmx(p[3], p[6]); mmx(p[1], p[4]); mmx(p[2], p[5]);
+    mmx(p[4], p[7]); mmx(p[4], p[2]); mmx(p[6], p[4]);
+    mmx(p[4], p[2]);
+    return p[4];
+}
+
 // --- Sobel (tiled) ---
-__global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void sobelTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     extern __shared__ unsigned char tile[];
     const int radius = 1;
     int tileW = blockDim.x + 2 * radius;
@@ -166,7 +185,9 @@ __global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, i
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     float sx = 0, sy = 0;
+#pragma unroll
     for (int ky = 0; ky < 3; ++ky)
+#pragma unroll
         for (int kx = 0; kx < 3; ++kx) {
             int p = tile[(threadIdx.y + ky) * tileW + (threadIdx.x + kx)];
             int idx = ky * 3 + kx;
@@ -177,12 +198,15 @@ __global__ void sobelTiled(const unsigned char* in, unsigned char* out, int W, i
     out[y * W + x] = (unsigned char)fminf(255.0f, fmaxf(0.0f, mag));
 }
 
-__global__ void sobelNaive(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void sobelNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     float sx = 0, sy = 0;
+#pragma unroll
     for (int ky = -1; ky <= 1; ++ky)
+#pragma unroll
         for (int kx = -1; kx <= 1; ++kx) {
             int px = clampi_dev(x + kx, 0, W - 1);
             int py = clampi_dev(y + ky, 0, H - 1);
@@ -196,7 +220,8 @@ __global__ void sobelNaive(const unsigned char* in, unsigned char* out, int W, i
 }
 
 // --- Gaussian (tiled, 5x5) ---
-__global__ void gaussianTiled(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void gaussianTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     extern __shared__ unsigned char tile[];
     const int radius = 2;
     int tileW = blockDim.x + 2 * radius;
@@ -220,7 +245,8 @@ __global__ void gaussianTiled(const unsigned char* in, unsigned char* out, int W
     out[y * W + x] = (unsigned char)fminf(255.0f, fmaxf(0.0f, acc + 0.5f));
 }
 
-__global__ void gaussianNaive(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void gaussianNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
@@ -235,7 +261,8 @@ __global__ void gaussianNaive(const unsigned char* in, unsigned char* out, int W
 }
 
 // --- Median (tiled, 3x3) ---
-__global__ void medianTiled(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void medianTiled(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     extern __shared__ unsigned char tile[];
     const int radius = 1;
     int tileW = blockDim.x + 2 * radius;
@@ -257,15 +284,11 @@ __global__ void medianTiled(const unsigned char* in, unsigned char* out, int W, 
     for (int ky = 0; ky < 3; ++ky)
         for (int kx = 0; kx < 3; ++kx)
             w[c++] = tile[(threadIdx.y + ky) * tileW + (threadIdx.x + kx)];
-    for (int i = 1; i < 9; ++i) {
-        unsigned char key = w[i]; int j = i - 1;
-        while (j >= 0 && w[j] > key) { w[j + 1] = w[j]; --j; }
-        w[j + 1] = key;
-    }
-    out[y * W + x] = w[4];
+    out[y * W + x] = median9(w);
 }
 
-__global__ void medianNaive(const unsigned char* in, unsigned char* out, int W, int H) {
+__global__ void medianNaive(const unsigned char* __restrict__ in,
+    unsigned char* __restrict__ out, int W, int H) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
@@ -277,12 +300,7 @@ __global__ void medianNaive(const unsigned char* in, unsigned char* out, int W, 
             int sy = clampi_dev(y + ky, 0, H - 1);
             w[c++] = in[sy * W + sx];
         }
-    for (int i = 1; i < 9; ++i) {
-        unsigned char key = w[i]; int j = i - 1;
-        while (j >= 0 && w[j] > key) { w[j + 1] = w[j]; --j; }
-        w[j + 1] = key;
-    }
-    out[y * W + x] = w[4];
+    out[y * W + x] = median9(w);
 }
 
 // ============================================================================
@@ -332,8 +350,10 @@ struct GpuCtx {
         CUDA_CHECK(cudaMalloc(&d_out, bytes));
         CUDA_CHECK(cudaHostAlloc(&h_in_pinned, bytes, cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&h_out_pinned, bytes, cudaHostAllocDefault));
-        // Strip size for 8-stream pipeline.
-        int stripRowsMax = (H + 7) / 8 + 2;   // halo radius 1 is enough for our filters
+        // Strip size for 8-stream pipeline. Boyut en buyuk radius'a gore
+        // ayrilmali: Gaussian 5x5 -> radius 2. Aksi halde Gaussian+stream tasar.
+        const int maxRadius = 2;
+        int stripRowsMax = (H + 7) / 8 + 2 * maxRadius;
         size_t stripBytes = (size_t)W * stripRowsMax;
         streams.resize(nStreams); d_inS.resize(nStreams); d_outS.resize(nStreams);
         for (int s = 0; s < nStreams; ++s) {
@@ -358,7 +378,9 @@ struct GpuCtx {
 static void runGpuSimple(GpuCtx& ctx, Backend backend, FilterMode filter,
     const unsigned char* h_in, unsigned char* h_out) {
     int W = ctx.W, H = ctx.H;
-    CUDA_CHECK(cudaMemcpy(ctx.d_in, h_in, ctx.bytes, cudaMemcpyHostToDevice));
+    // Pinned buffer uzerinden stage et: H2D/D2H bandwidth ~2x.
+    std::memcpy(ctx.h_in_pinned, h_in, ctx.bytes);
+    CUDA_CHECK(cudaMemcpy(ctx.d_in, ctx.h_in_pinned, ctx.bytes, cudaMemcpyHostToDevice));
     dim3 block(16, 16);
     dim3 grid((W + 15) / 16, (H + 15) / 16);
     int radius = (filter == F_GAUSSIAN) ? 2 : 1;
@@ -369,12 +391,14 @@ static void runGpuSimple(GpuCtx& ctx, Backend backend, FilterMode filter,
         if (filter == F_SOBEL)         sobelNaive << <grid, block >> > (ctx.d_in, ctx.d_out, W, H);
         else if (filter == F_GAUSSIAN) gaussianNaive << <grid, block >> > (ctx.d_in, ctx.d_out, W, H);
         else                           medianNaive << <grid, block >> > (ctx.d_in, ctx.d_out, W, H);
-    } else { // tiled
+    }
+    else { // tiled
         if (filter == F_SOBEL)         sobelTiled << <grid, block, shmem >> > (ctx.d_in, ctx.d_out, W, H);
         else if (filter == F_GAUSSIAN) gaussianTiled << <grid, block, shmem >> > (ctx.d_in, ctx.d_out, W, H);
         else                           medianTiled << <grid, block, shmem >> > (ctx.d_in, ctx.d_out, W, H);
     }
-    CUDA_CHECK(cudaMemcpy(h_out, ctx.d_out, ctx.bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(ctx.h_out_pinned, ctx.d_out, ctx.bytes, cudaMemcpyDeviceToHost));
+    std::memcpy(h_out, ctx.h_out_pinned, ctx.bytes);
 }
 
 // Stream-pipelined: copies into pinned, runs strips across N streams.
@@ -429,7 +453,8 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         cap.open(argv[1]);
         printf("Opened video file: %s\n", argv[1]);
-    } else {
+    }
+    else {
         cap.open(0);                                       // default webcam
         cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
@@ -454,13 +479,14 @@ int main(int argc, char** argv) {
     auto pushMs = [&](double ms) {
         frameMs.push_back(ms);
         if (frameMs.size() > 30) frameMs.pop_front();
-    };
+        };
     auto avgMs = [&]() {
         if (frameMs.empty()) return 0.0;
         return std::accumulate(frameMs.begin(), frameMs.end(), 0.0) / frameMs.size();
-    };
+        };
 
-    cv::Mat frame, gray, out;
+    // 'side' artik dongu disinda; create() ayni boyutta no-op olur, realloc yok.
+    cv::Mat frame, gray, out, side;
     const std::string winName = "CENG479 Live Demo - press C/G/T/S, 1/2/3, ESC";
     cv::namedWindow(winName, cv::WINDOW_NORMAL);
 
@@ -497,7 +523,7 @@ int main(int argc, char** argv) {
         cv::cvtColor(out, disp, cv::COLOR_GRAY2BGR);
 
         // Side-by-side: original on left, filtered on right.
-        cv::Mat side(disp.rows, disp.cols * 2, CV_8UC3);
+        side.create(disp.rows, disp.cols * 2, CV_8UC3);
         frame.copyTo(side(cv::Rect(0, 0, disp.cols, disp.rows)));
         disp.copyTo(side(cv::Rect(disp.cols, 0, disp.cols, disp.rows)));
 
@@ -538,9 +564,9 @@ int main(int argc, char** argv) {
         else if (key == 'g' || key == 'G') { backend = B_GPU_NAIVE;  frameMs.clear(); }
         else if (key == 't' || key == 'T') { backend = B_GPU_TILED;  frameMs.clear(); }
         else if (key == 's' || key == 'S') { backend = B_GPU_STREAM; frameMs.clear(); }
-        else if (key == '1')               { filter  = F_SOBEL;      frameMs.clear(); }
-        else if (key == '2')               { filter  = F_GAUSSIAN;   frameMs.clear(); }
-        else if (key == '3')               { filter  = F_MEDIAN;     frameMs.clear(); }
+        else if (key == '1') { filter = F_SOBEL;      frameMs.clear(); }
+        else if (key == '2') { filter = F_GAUSSIAN;   frameMs.clear(); }
+        else if (key == '3') { filter = F_MEDIAN;     frameMs.clear(); }
     }
     return 0;
 }
