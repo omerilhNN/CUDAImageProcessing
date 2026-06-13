@@ -22,74 +22,6 @@ A CENG-479 *Parallel Programming* final project at Gazi University, Department o
 Instructor: *Asst. Prof. Dr. Hüseyin Temuçin*
 
 ---
-How to Run — Step by Step
-
-
-⚠️ Important — build order matters. LiveDemo depends on the CUDA kernels and helper code produced by the CudaImageProcessing project. You must build CudaImageProcessing first; otherwise LiveDemo will fail to link or load. Run the projects in the order below.
-
-
-
-Step 1 — Clone the repository
-
-powershellgit clone https://github.com/omerilhNN/CUDAImageProcessing.git
-cd CUDAImageProcessing
-
-Step 2 — Prepare the environment (one-time setup)
-
-
-Install Visual Studio 2022 with the Desktop development with C++ workload.
-Install the CUDA Toolkit 12.x (the VS integration must be selected during install).
-Install OpenCV 4.x and add its build/x64/vc16/bin directory to your system PATH. This DLL is required by LiveDemo for webcam capture.
-Verify the install from a terminal:
-
-
-powershell   nvcc --version          # should print CUDA 12.x
-   nvidia-smi              # should list your GPU
-
-Step 3 — Build & run the benchmark suite (CudaImageProcessing) — do this first
-
-This is the main project: sequential baseline + four CUDA variants. Building it also produces the CUDA object files that LiveDemo will link against.
-
-
-Open the solution:
-
-
-powershell   start CudaImageProcessing\CudaImageProcessing.sln
-
-
-In the toolbar, select Release | x64.
-Right-click the CudaImageProcessing project → Properties → CUDA C/C++ → Device → Code Generation and set it to compute_89,sm_89 (or the value matching your GPU from the table above).
-Build → Build Solution (Ctrl + Shift + B). Wait for Build: 1 succeeded.
-Run with Ctrl + F5. A console window opens and the benchmark sweeps every filter, variant, and block size. You should see a table like the one in Running the Benchmark Suite below, with PASS on every row. Filter output images are written next to the executable in CudaImageProcessing\x64\Release\.
-Confirm the build artifacts exist:
-
-
-powershell   dir CudaImageProcessing\x64\Release\*.exe
-
-If CudaImageProcessing.exe is there, you're ready for Step 4.
-
-Step 4 — Build & run the LiveDemo (LiveDemo) — only after Step 3 succeeds
-
-LiveDemo reuses the CUDA filter implementations from Step 3 and adds a webcam capture loop on top.
-
-
-Open the solution:
-
-
-powershell   start LiveDemo\LiveDemo.sln
-
-
-Select Release | x64 (must match Step 3 — mixing Debug/Release will cause link errors).
-Make sure the SM target matches what you used in Step 3.
-Plug in your webcam (or ensure the built-in camera is enabled in Windows privacy settings).
-Build → Build Solution (Ctrl + Shift + B).
-Run with Ctrl + F5. The webcam window opens automatically with an on-screen FPS counter.
-Press 1/2/3/4 to switch backends in real time — see the next section for the key map.
-
-
-
-💡 If LiveDemo reports a missing opencv_world4xx.dll at launch, either fix your PATH (Step 2.3) or copy the DLL from your OpenCV install into LiveDemo\x64\Release\ next to LiveDemo.exe.
-
 
 ## Repository Layout
 
@@ -151,29 +83,62 @@ In Visual Studio, set CUDA C/C++ → Device → **Code Generation = `compute_89,
 
 ---
 
-## Building
+## How to Run — Step by Step
 
-### Benchmark suite
+> ⚠️ **Important — build order matters.** `LiveDemo` depends on the CUDA kernels and helper code produced by the `CudaImageProcessing` project. You **must build `CudaImageProcessing` first**; otherwise `LiveDemo` will fail to link or load. Run the projects in the order below.
 
-```powershell
-# From the repository root, open in Visual Studio
-start CudaImageProcessing\CudaImageProcessing.sln
-```
-
-1. Select the **Release | x64** configuration.
-2. Set the SM target as described above.
-3. Build → Build Solution (`Ctrl + Shift + B`).
-4. Run (`Ctrl + F5`). The benchmark prints a per-configuration table and writes filter output images next to the executable.
-
-### LiveDemo
+### Step 1 — Clone the repository
 
 ```powershell
-start LiveDemo\LiveDemo.sln
+git clone https://github.com/omerilhNN/CUDAImageProcessing.git
+cd CUDAImageProcessing
 ```
 
-1. Make sure the OpenCV `bin/` directory (containing `opencv_world4xx.dll`) is on your `PATH`, or copy the DLL next to the built `.exe`.
-2. Build **Release | x64**.
-3. Run — your default webcam opens automatically.
+### Step 2 — Prepare the environment (one-time setup)
+
+1. Install **Visual Studio 2022** with the *Desktop development with C++* workload.
+2. Install the **CUDA Toolkit 12.x** (the VS integration must be selected during install).
+3. Install **OpenCV 4.x** and add its `build/x64/vc16/bin` directory to your system `PATH`. This DLL is required by `LiveDemo` for webcam capture.
+4. Verify the install from a terminal:
+   ```powershell
+   nvcc --version          # should print CUDA 12.x
+   nvidia-smi              # should list your GPU
+   ```
+
+### Step 3 — Build & run the benchmark suite (`CudaImageProcessing`) — **do this first**
+
+This is the main project: sequential baseline + four CUDA variants. Building it also produces the CUDA object files that `LiveDemo` will link against.
+
+1. Open the solution:
+   ```powershell
+   start CudaImageProcessing\CudaImageProcessing.sln
+   ```
+2. In the toolbar, select **Release | x64**.
+3. Right-click the `CudaImageProcessing` project → **Properties → CUDA C/C++ → Device → Code Generation** and set it to `compute_89,sm_89` (or the value matching your GPU from the table above).
+4. **Build → Build Solution** (`Ctrl + Shift + B`). Wait for `Build: 1 succeeded`.
+5. Run with `Ctrl + F5`. A console window opens and the benchmark sweeps every filter, variant, and block size. You should see a table like the one in [Running the Benchmark Suite](#running-the-benchmark-suite) below, with `PASS` on every row. Filter output images are written next to the executable in `CudaImageProcessing\x64\Release\`.
+6. Confirm the build artifacts exist:
+   ```powershell
+   dir CudaImageProcessing\x64\Release\*.exe
+   ```
+   If `CudaImageProcessing.exe` is there, you're ready for Step 4.
+
+### Step 4 — Build & run the LiveDemo (`LiveDemo`) — **only after Step 3 succeeds**
+
+`LiveDemo` reuses the CUDA filter implementations from Step 3 and adds a webcam capture loop on top.
+
+1. Open the solution:
+   ```powershell
+   start LiveDemo\LiveDemo.sln
+   ```
+2. Select **Release | x64** (must match Step 3 — mixing Debug/Release will cause link errors).
+3. Make sure the SM target matches what you used in Step 3.
+4. Plug in your webcam (or ensure the built-in camera is enabled in Windows privacy settings).
+5. **Build → Build Solution** (`Ctrl + Shift + B`).
+6. Run with `Ctrl + F5`. The webcam window opens automatically with an on-screen FPS counter.
+7. Press `1`/`2`/`3`/`4` to switch backends in real time — see the next section for the key map.
+
+> 💡 If `LiveDemo` reports a missing `opencv_world4xx.dll` at launch, either fix your `PATH` (Step 2.3) or copy the DLL from your OpenCV install into `LiveDemo\x64\Release\` next to `LiveDemo.exe`.
 
 ---
 
@@ -252,7 +217,16 @@ Timing methodology: a warm-up launch primes caches/JIT before timing; each confi
 
 ---
 
+## References
 
+1. Amdahl, G. M. (1967). *Validity of the single processor approach to achieving large scale computing capabilities.* AFIPS '67.
+2. Canny, J. (1986). *A computational approach to edge detection.* IEEE TPAMI 8(6).
+3. Daga, M., Aji, A. M., & Feng, W. C. (2011). *On the efficacy of a fused CPU+GPU processor for parallel computing.* SASP 2011.
+4. Fialka, O., & Čadík, M. (2006). *FFT and convolution performance in image filtering on GPU.* IV '06.
+5. Jang, B., Schaa, D., Mistry, P., & Kaeli, D. (2010). *Exploiting memory access patterns to improve memory performance in data-parallel architectures.* IEEE TPDS 22(1).
+6. NVIDIA Corporation. (2024). *CUDA C++ Programming Guide.* https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+---
 
 ## License
 
