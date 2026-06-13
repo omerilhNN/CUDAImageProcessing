@@ -1,12 +1,49 @@
 {
   "Version": 1,
-  "WorkspaceRootPath": "C:\\SW\\LiveDemo\\",
-  "Documents": [],
+  "WorkspaceRootPath": "C:\\Users\\erend\\source\\repos\\CUDAImageProcessing\\LiveDemo\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{8A58CABB-BF82-BBC0-40D1-72368C8ECE0E}|LiveDemo.vcxproj|C:\\Users\\erend\\source\\repos\\CUDAImageProcessing\\LiveDemo\\live_demo.cu||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{8A58CABB-BF82-BBC0-40D1-72368C8ECE0E}|LiveDemo.vcxproj|solutionrelative:live_demo.cu||{8B382828-6202-11D1-8870-0000F87579D2}"
+    }
+  ],
   "DocumentGroupContainers": [
     {
       "Orientation": 0,
       "VerticalTabListWidth": 256,
-      "DocumentGroups": []
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 3,
+          "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{40ea2e6b-2121-4bb8-a43e-c83c04b51041}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:128:0:{75188d03-9892-4ae2-abf1-207126247ce5}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "live_demo.cu",
+              "DocumentMoniker": "C:\\Users\\erend\\source\\repos\\CUDAImageProcessing\\LiveDemo\\live_demo.cu",
+              "RelativeDocumentMoniker": "live_demo.cu",
+              "ToolTip": "C:\\Users\\erend\\source\\repos\\CUDAImageProcessing\\LiveDemo\\live_demo.cu",
+              "RelativeToolTip": "live_demo.cu",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAAoAAAAtAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-06-13T19:22:45.038Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
     }
   ]
 }
